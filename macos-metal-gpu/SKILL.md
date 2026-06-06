@@ -1,8 +1,8 @@
 ---
 name: macos-metal-gpu
 description: "Metal GPU programming for macOS: MTKView integration via NSViewRepresentable, render and compute pipelines, MTLHeap resource management, GPU selection and family feature detection, synchronization with fences and events, CAMetalLayer direct rendering, and MSL shader conventions. Use when building GPU-accelerated rendering, compute workloads, or custom Metal views in a macOS app."
-sources: https://medium.com/@giikwebdeveloper/metal-4-for-swiftui-33209c1134e9, https://medium.com/@giikwebdeveloper/metal-view-for-swiftui-93f5f78ec36a, https://apple-docs.everest.mt/docs/metal/using-metal-to-draw-a-view's-contents/, https://developer.apple.com/forums/thread/119112
-researched: 2026-06-05
+sources: https://medium.com/@giikwebdeveloper/metal-4-for-swiftui-33209c1134e9, https://medium.com/@giikwebdeveloper/metal-view-for-swiftui-93f5f78ec36a, https://apple-docs.everest.mt/docs/metal/using-metal-to-draw-a-view's-contents/, https://developer.apple.com/forums/thread/119112, https://developer.apple.com/documentation/metal/mtlheap, https://developer.apple.com/documentation/quartzcore/cametallayer, https://developer.apple.com/videos/play/tech-talks/111373/, https://developer.apple.com/documentation/metal/selecting-device-objects-for-graphics-rendering/
+researched: 2026-06-06
 platform: macOS 26+
 ---
 
@@ -68,9 +68,30 @@ struct MetalCanvasView: NSViewRepresentable {
 | `autoResizeDrawable` | When `true` (default), drawable size tracks the view's bounds. Set `false` for fixed-resolution rendering. |
 | `drawableSize` | The actual drawable dimensions in pixels. Use this for viewport setup, not `bounds`. |
 
+The Coordinator pattern is the recommended way to bridge `MTKViewDelegate` into SwiftUI:
+
+```swift
+struct Metal4View: NSViewRepresentable {
+    func makeCoordinator() -> Renderer {
+        Renderer(device: MTLCreateSystemDefaultDevice()!)
+    }
+
+    func makeNSView(context: Context) -> MTKView {
+        let view = MTKView()
+        view.device = context.coordinator.device
+        view.delegate = context.coordinator
+        return view
+    }
+
+    func updateNSView(_ nsView: MTKView, context: Context) { }
+}
+```
+
 **Display-link vs manual:** The default mode (`enableSetNeedsDisplay = false`) uses a `CVDisplayLink` that fires at the display's refresh rate. This is the correct choice for real-time rendering. Switch to `enableSetNeedsDisplay = true` only for content that updates on demand (e.g., a static visualization that changes when the user interacts).
 
 **Drawable size vs bounds:** `drawableSize` is in pixels (accounting for the view's `contentsScale`). `bounds` is in points. Always use `drawableSize` for render target sizing and viewport configuration.
+
+**SwiftUI layout note:** SwiftUI controls the layout of the wrapped `NSView`. Do not manually set `frame`/`bounds` on the MTKView from your code. Implement `sizeThatFits(_:nsView:context:)` for custom sizing if needed.
 
 ## GPU Selection
 
@@ -103,6 +124,10 @@ let headless = allDevices.first { $0.isHeadless }
 | `recommendedMaxWorkingSetSize` | Upper bound for GPU memory allocation. Respect this to avoid paging. |
 | `maxBufferLength` | Maximum size of a single buffer in bytes. |
 | `supportsFamily(_:)` | Check GPU family for feature availability. |
+
+**Apple Silicon (2025+):** On Apple Silicon Macs, `MTLCreateSystemDefaultDevice()` returns the single unified GPU. There is no discrete/integrated split — all GPU work runs on the same chip. `isLowPower`, `isRemovable`, and `isHeadless` are always `false`. `hasUnifiedMemory` is always `true`.
+
+**Multi-GPU (Intel/Studio Macs):** When multiple GPUs are present, choose the optimal device per display. Use `CGDirectDisplayID` to identify which GPU drives a given monitor and render with that device to avoid cross-GPU drawable transfers. Observe `NSApplicationDidChangeScreenParametersNotification` to handle display reconfiguration at runtime, and use `MTLCopyAllDevicesWithObserver` for hot-plug eGPU support.
 
 **eGPU handling:** When `isRemovable` is `true`, the device can disappear at any time. Observe `MTLDeviceWasAddedNotification` and `MTLDeviceWasRemovedNotification` to handle hot-plug. Always fall back to the integrated GPU if the eGPU disconnects.
 
@@ -199,6 +224,13 @@ encoder.endEncoding()
 
 **Threadgroup memory:** Use `setThreadgroupMemoryLength(_:at:)` for data shared within a threadgroup. This is on-chip memory — much faster than buffer access. Typical use: reduction operations, shared tile data for image filters.
 
+**Dispatch best practices (2025):** Use a 3D grid of threadgroups distributed uniformly across GPU cores. Each core has its own fast, limited threadgroup memory (typically 32 KB on Apple Silicon). Use `dispatchThreads(_:threadsPerThreadgroup:)` (Xcode 15+) for simpler sizing when Metal can calculate threadgroup counts automatically:
+
+```swift
+let gridSize = MTLSize(width: width, height: height, depth: 1)
+encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadsPerThreadgroup)
+```
+
 ## MTLHeap Resource Management
 
 Heaps allocate GPU memory in bulk and let you create placed resources within the heap. This reduces allocation overhead and enables aliasing (reusing the same memory for different resources at different times).
@@ -243,6 +275,12 @@ let texture = heap.makeTexture(descriptor: textureDescriptor)!
 **`MTLSizeAndAlign`:** When placing resources in a heap, each resource has alignment and size requirements. Query with `heap.makeTexture(descriptor:)` — Metal handles alignment automatically. For manual placement (advanced), use `heap.makeTexture(descriptor:offset:)` and check alignment with `device.heapTextureSizeAndAlign(descriptor:)`.
 
 **Aliasing:** Multiple resources can share heap memory if they are not used simultaneously. Use `makeTexture(descriptor:offset:)` to place a texture at a specific offset within the heap, overlapping with another texture that is no longer in use. This is the primary performance benefit of heaps — reduced memory footprint for transient resources.
+
+**Heap sizing:** Size heaps large enough for their resources. Query available space with `heap.maxAvailableSize(alignment:)` before sub-allocating. Keep `heap.usedSize` and `heap.currentAllocatedSize` within your memory budget. On macOS, using a small number of well-managed heaps reduces memory pressure and minimizes memory compression delays.
+
+**Fragmentation:** Creating and deleting many sub-allocated resources can fragment heap memory. Use multiple heaps or allocate similarly sized resources in contiguous blocks to mitigate fragmentation. Keep separate heaps for aliasable resources vs non-aliasable resources (e.g., compressible depth textures and MSAA textures cannot alias).
+
+**Sync with fences:** A single `MTLFence` can track multiple sub-allocated resources with identical synchronization requirements. Use `updateFence`/`waitForFence` to enforce ordering between compute and render passes that access heap-backed resources.
 
 ## Synchronization
 
@@ -373,16 +411,20 @@ final class MetalHostingView: NSView {
 
 **When to use CAMetalLayer directly:**
 
-- Off-screen rendering to a texture (no display output)
+- Off-screen rendering to a texture (no display output). Render into a drawable obtained from `nextDrawable()` without presenting to screen, or render to a standalone `MTLTexture`.
 - Custom layer composition (multiple Metal layers in one view)
 - Integrating with Core Animation animations on the layer
 - Rendering to a specific `CGContext` or `IOSurface`
+
+**Off-screen rendering pattern:** For pure off-screen work, render to a drawable obtained from `nextDrawable()` and read back its texture, or better yet, render directly to a private `MTLTexture` and avoid the drawable overhead entirely.
 
 **`maximumDrawableCount`:** Set to 2 (double buffering) or 3 (triple buffering). Triple buffering improves GPU utilization at the cost of one frame of latency. Use 2 for latency-sensitive applications (VR, real-time input).
 
 **`framebufferOnly`:** Set to `true` (default) when the drawable texture is only used as a render target. Set to `false` when you need to read the texture back (e.g., for screenshot, video encoding). `false` may use more memory.
 
 **Contents scale:** Update `contentsScale` in `viewDidChangeBackingProperties()` to handle display changes (moving between Retina and non-Retina displays).
+
+**Drawable lifecycle:** Drawables are reused only if not onscreen and there are no strong references. If `nextDrawable()` has no available drawable, the system waits. Release references promptly — wrap rendering in an autoreleasepool to release drawables promptly after presenting and avoid deadlocks or nil drawables.
 
 ## MSL Conventions
 
@@ -467,6 +509,22 @@ On Apple Silicon, `half` operations are as fast as `float` in many cases. Prefer
 | `threadgroup` | On-chip shared memory within a threadgroup. |
 | `thread` | Per-thread private memory (registers/stack). |
 
+### MSL Performance Best Practices (2025)
+
+From Apple's Tech Talks and the MSL specification:
+
+- **Function groups and attributes:** Use function group attributes at call sites to enable indirect function calls and unlock more shader optimizations, especially for statically linked functions. Enables the Metal compiler to perform cross-function analysis.
+
+- **Threadgroup memory vs. device/constant:** On Apple Family 9 (M3/A17 Pro), the benefit of threadgroup memory as a software cache is reduced compared to older GPUs. If data fits in cache, reading from device/constant buffers directly may be faster than copying to threadgroup memory first. Profile on your target hardware.
+
+- **Occupancy tuning:** Optimize thread occupancy through efficient resource usage (registers, memory). Use Metal profiling tools (updated for M3/A17 Pro) to identify lower thread occupancy bottlenecks. Occupancy management is more important on newer GPU generations.
+
+- **Language revisions:** MSL supports language revisions from 1.x through 3.x (Metal 3.0/3.1). Metal 3 introduces mesh shaders and hardware ray tracing. Use `-std=metal3.0` or later when targeting recent Apple Silicon.
+
+- **Max threadgroup size attribute:** Tune total threads per threadgroup via `-fmax-total-threads-per-threadgroup` compile option or `[[max_total_threads_per_threadgroup]]` attribute on compute kernels. This is important for PSO compatibility and hardware-specific tuning.
+
+- **SIMD-group synchronization:** Use `threadgroup_barrier(mem_flags::mem_threadgroup)` for proper synchronization after writing to threadgroup memory. For SIMD-group-level sync within a threadgroup, use SIMD-group functions for finer control.
+
 ## Constraints & Gotchas
 
 - **Main thread requirement:** `MTKView` and `CAMetalLayer` must be created and accessed from the main thread. Command buffer encoding can happen on any thread.
@@ -488,6 +546,7 @@ On Apple Silicon, `half` operations are as fast as `float` in many cases. Prefer
 - **Using `StorageModePrivate` on Apple Silicon** for buffers that the CPU needs to read — use `StorageModeShared` instead; unified memory makes private storage unnecessary for most cases.
 - **Forgetting to call `buffer.present(drawable)`** — the drawable is never displayed, and the layer's drawable pool eventually exhausts.
 - **Not updating `contentsScale`** when the view moves to a different display — rendering appears at the wrong resolution.
+- **Not using autorelease pool** around CAMetalLayer rendering — drawables may not be released promptly, exhausting the drawable pool and causing `nextDrawable()` to block.
 
 ## Review Checklist
 
@@ -499,14 +558,21 @@ On Apple Silicon, `half` operations are as fast as `float` in many cases. Prefer
 - [ ] Render pipeline descriptor matches attachment pixel formats
 - [ ] Compute threadgroup size is a multiple of 32 and within `maxTotalThreadsPerThreadgroup`
 - [ ] Heap resources use appropriate hazard tracking mode
+- [ ] Heaps sized appropriately; used for aliasable and non-aliasing resources separately
 - [ ] Fences used for intra-encoder sync, events for cross-queue sync
 - [ ] CAMetalLayer `contentsScale` updated on display change
+- [ ] `maximumDrawableCount` set to 2 or 3; autorelease pool used for rendering
 - [ ] MSL buffer/texture/sampler indices match encoder bindings
 - [ ] Pipeline states cached, not recreated per frame
 - [ ] Command buffers not reused after commit
+- [ ] MSL language revision aligned to target OS version (metal3.0+ for recent features)
 
 ## References
 
 - [references/metal-macos-patterns.md](references/metal-macos-patterns.md) — Complete MSL shader examples, GPU family feature table, compute pipeline recipes, synchronization patterns
-- [sosumi.ai/documentation/Metal](https://sosumi.ai/documentation/Metal) — Metal framework reference
-- [sosumi.ai/documentation/MetalKit](https://sosumi.ai/documentation/MetalKit) — MetalKit framework reference
+- [Apple Developer: MTLHeap](https://developer.apple.com/documentation/metal/mtlheap) — Heap API reference
+- [Apple Developer: CAMetalLayer](https://developer.apple.com/documentation/quartzcore/cametallayer) — Layer reference
+- [Apple Developer: Selecting Device Objects for Graphics Rendering](https://developer.apple.com/documentation/metal/selecting-device-objects-for-graphics-rendering/) — Multi-GPU guidance
+- [Apple Developer: Learn performance best practices for Metal shaders (Tech Talks 111373)](https://developer.apple.com/videos/play/tech-talks/111373/) — MSL performance best practices
+- [Apple Developer: NSViewRepresentable](https://developer.apple.com/documentation/swiftui/nsviewrepresentable) — SwiftUI wrapping pattern
+- [Metal Shading Language Specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) — MSL language reference

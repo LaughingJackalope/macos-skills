@@ -1,8 +1,8 @@
 ---
 name: macos-system-integration
 description: "System-level macOS integration patterns: SMAppService login items and launch agents, NSWorkspace app lifecycle, security-scoped bookmarks, NSPasteboard custom UTType and promised data, Core Spotlight indexing, Quick Look preview, AppleScript automation, and NSFileCoordinator/NSFilePresenter coordinated file access. Use when registering daemons or agents, opening files and launching apps, persisting sandbox file access, implementing drag-and-drop with custom types, indexing content for Spotlight, presenting Quick Look previews, scripting other apps, or coordinating file reads/writes across processes."
-sources: https://developer.apple.com/documentation/servicemanagement/smappservice, https://developer.apple.com/forums/thread/719862, https://developer.apple.com/forums/thread/758393, https://developer.apple.com/documentation/corespotlight, https://developer.apple.com/documentation/quicklook
-researched: 2026-06-05
+sources: https://developer.apple.com/documentation/servicemanagement/smappservice, https://developer.apple.com/forums/thread/719862, https://developer.apple.com/forums/thread/758393, https://developer.apple.com/documentation/corespotlight, https://developer.apple.com/documentation/quicklook, https://developer.apple.com/documentation/appkit/nsworkspace, https://developer.apple.com/documentation/appkit/nspasteboard, https://developer.apple.com/documentation/quicklookui/qlpreviewview, https://developer.apple.com/videos/play/wwdc2024/10131/
+researched: 2026-06-05 (enhanced 2026-06-06)
 platform: macOS 26+
 ---
 
@@ -138,12 +138,18 @@ if service.status == .requiresApproval {
     if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
         NSWorkspace.shared.open(url)
     }
+    // Or use the SMAppService API directly:
+    SMAppService.openSystemSettingsLoginItems()
 }
 ```
 
+**Open at Login vs. Allow in the Background:** On macOS 13+, these are now separate concepts. "Open at Login" launches a full app (UI). "Allow in the Background" is for non-UI helpers that need to run background tasks. For LaunchDaemons, a single user authorization enables all of the app's helpers.
+
+**`mainApp` constructor:** `SMAppService.mainApp` registers the main app itself as a login item (used for "Open at Login" on macOS Ventura-style menu items).
+
 ## NSWorkspace: App Lifecycle and File Opening
 
-`NSWorkspace` (replacing the deprecated `NSWorkspace.shared` singleton pattern) is the primary interface for launching apps, opening files, and observing the app lifecycle on macOS.
+`NSWorkspace` is the primary interface for launching apps, opening files, and observing the app lifecycle on macOS. Access it via the per-app singleton `NSWorkspace.shared`.
 
 ### Opening Files and URLs
 
@@ -166,7 +172,25 @@ try await NSWorkspace.shared.open(
     [fileURL],
     withApplicationAt: appURL,
     configuration: config
+```
+
+### File Operations
+
+`NSWorkspace` provides Finder-like file operations (copy, move, delete, link) that display system progress UI:
+
+```swift
+// Copy/move with system progress dialog
+let success = NSWorkspace.shared.performFileOperation(
+    .copy,
+    source: sourceFolder.path,
+    destination: destFolder.path,
+    files: [file1.lastPathComponent, file2.lastPathComponent],
+    tag: nil
 )
+
+// Quick helpers
+NSWorkspace.shared.selectFile(fileURL.path, inFileViewerRootedAtPath: "")  // Reveal in Finder
+NSWorkspace.shared.recycle([fileURL])  // Move to Trash
 ```
 
 ### Launching Applications
@@ -238,6 +262,7 @@ final class AppLifecycleObserver {
 
 | Notification | When |
 |---|---|
+| `willLaunchApplicationNotification` | An app is about to launch (pre-launch hook) |
 | `didLaunchApplicationNotification` | An app finishes launching |
 | `didTerminateApplicationNotification` | An app has quit |
 | `didActivateApplicationNotification` | An app becomes active (frontmost) |
@@ -363,6 +388,69 @@ if let data = pb.data(forType: .myDocument),
 }
 ```
 
+### NSPasteboardWriting / NSPasteboardReading Protocol Conformance
+
+For type-safe pasteboard protocols, make your custom class conform to `NSPasteboardWriting` and `NSPasteboardReading`:
+
+```swift
+final class ProjectBookmark: NSObject, NSPasteboardWriting, NSPasteboardReading {
+    let name: String
+    let fileURL: URL
+
+    init(name: String, fileURL: URL) {
+        self.name = name
+        self.fileURL = fileURL
+    }
+
+    // NSPasteboardWriting
+    static func readableClasses(for pasteboard: NSPasteboard) -> [AnyClass] {
+        [ProjectBookmark.self]
+    }
+
+    init?(pasteboardPropertyList propertyList: Any, ofType type: NSPasteboard.PasteboardType) {
+        guard let data = propertyList as? Data,
+              let decoded = try? JSONDecoder().decode(ProjectBookmark.self, from: data) else {
+            return nil
+        }
+        self.name = decoded.name
+        self.fileURL = decoded.fileURL
+    }
+
+    func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
+        [.projectBookmark, .string]  // ordered: best type first
+    }
+
+    func writingOptions(for type: NSPasteboard.PasteboardType, pasteboard: NSPasteboard) -> NSPasteboard.WritingOptions {
+        type == .projectBookmark ? .promised : []  // promise the data, deliver lazily
+    }
+
+    func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+        switch type {
+        case .projectBookmark:
+            return try? JSONEncoder().encode(self)
+        case .string:
+            return name
+        default:
+            return nil
+        }
+    }
+}
+
+// Register the custom type
+extension NSPasteboard.PasteboardType {
+    static let projectBookmark = NSPasteboard.PasteboardType("com.example.myapp.project-bookmark")
+}
+
+// Write
+pb.clearContents()
+pb.writeObjects([ProjectBookmark(name: "My Project", fileURL: url)])
+
+// Read
+if let objects = pb.readObjects(forClasses: [ProjectBookmark.self], options: nil) as? [ProjectBookmark] {
+    // use objects
+}
+```
+
 ### Promised Data (Lazy Delivery)
 
 For large data, promise the data and deliver it only when the destination requests it. Implement `NSPasteboardItemDataProvider`:
@@ -395,7 +483,9 @@ pb.writeObjects([item])
 
 ## Core Spotlight on macOS
 
-Core Spotlight lets your app index content so it appears in Spotlight search results. On macOS, users expect deep search into document content, metadata, and app-specific data.
+Core Spotlight lets your app index content so it appears in Spotlight search results. On macOS, users expect deep search into document content, metadata, and app-specific data. As of WWDC24, Core Spotlight supports **semantic search** — natural language queries that understand meaning, not just keywords. Semantic search is enabled by default when you use `CSSearchableItemAttributeSet` with text content.
+
+**macOS-specific:** Use Spotlight importer plugins for external file formats (not File Import extensions, which are iOS-only on macOS). Set `indexDelegate` on `CSSearchableIndex` to handle reindexing and errors. Implement a Core Spotlight index extension (`CSIndexExtension`) to reindex content when the app isn't running.
 
 ### Indexing Items
 
@@ -474,11 +564,95 @@ func batchIndex(items: [(id: String, title: String, content: String)]) async thr
 }
 ```
 
+### Batching with Client State (WWDC24)
+
+For large reindexing operations, use a named index with `beginBatch`/`endBatch` and client state to track progress across interruptions:
+
+```swift
+func fullReindex(allDocs: [Document]) async throws {
+    let index = CSSearchableIndex(name: "com.example.myapp.main")
+    index.indexDelegate = self
+
+    var state = ReindexState(lastProcessedID: "", totalCount: allDocs.count)
+
+    // Resume from last checkpoint
+    if let saved = index.clientState, let decoded = try? JSONDecoder().decode(ReindexState.self, from: saved) {
+        state = decoded
+    }
+
+    index.beginBatch()
+
+    let remaining = allDocs.drop { $0.id != state.lastProcessedID }
+    for doc in remaining {
+        let item = createSearchableItem(for: doc)
+        index.indexSearchableItems([item])
+        state.lastProcessedID = doc.id
+
+        // Checkpoint progress
+        index.clientState = try? JSONEncoder().encode(state)
+    }
+
+    index.endBatch(clientState: try JSONEncoder().encode(state), completionHandler: nil)
+}
+```
+
+### CSSearchableIndexDelegate
+
+Implement the delegate to handle reindexing requests and errors:
+
+```swift
+extension SpotlightIndexer: CSSearchableIndexDelegate {
+    func searchableIndex(_ searchableIndex: CSSearchableIndex, reindexSearchableItemsWithIdentifiers identifiers: [String], acknowledgementHandler: @escaping () -> Void) throws {
+        // Spotlight wants specific items reindexed (e.g., after a sync conflict)
+        try reindexItems(identifiers: identifiers)
+        acknowledgementHandler()
+    }
+
+    func searchableIndexDidFinishThrottle(_ searchableIndex: CSSearchableIndex) {
+        // System has stopped throttling your indexing calls; resume if paused
+    }
+
+    func data(for searchableIndex: CSSearchableIndex, itemIdentifier: String, typeIdentifier: String) throws -> Data? {
+        // Provide on-demand data for items registered with .promised writing option
+        nil
+    }
+
+    func fileURL(for searchableIndex: CSSearchableIndex, itemIdentifier: String, typeIdentifier: String, inPlace: Bool) throws -> URL? {
+        // Provide file URL for on-demand content
+        nil
+    }
+}
+```
+
 ## Quick Look
 
-Quick Look provides file previews without opening the full app. Integrate it via `QLPreviewPanel` (AppKit) or `.quickLookPreview` (SwiftUI).
+Quick Look provides file previews without opening the full app. Integrate it via `QLPreviewView` (inline, AppKit), `QLPreviewPanel` (floating panel, AppKit), or `.quickLookPreview` (SwiftUI).
 
-### QLPreviewPanel (AppKit)
+### QLPreviewView (Inline AppKit)
+
+Embed `QLPreviewView` directly in your view hierarchy for inline previews:
+
+```swift
+import QuickLookUI
+
+// Create an inline preview view in your AppKit view hierarchy
+let previewView = QLPreviewView(frame: rect, style: .compact)
+previewView?.autostarts = true
+previewView?.previewItem = fileURL as NSURL
+
+// Or use .normal style for a larger preview with controls
+let normalPreview = QLPreviewView(frame: rect, style: .normal)
+normalPreview?.autostarts = false  // Don't auto-start; show play button for video
+normalPreview?.previewItem = fileURL as NSURL
+```
+
+`QLPreviewViewStyle` options:
+| Style | Use |
+|---|---|
+| `.normal` | Full preview with playback controls, scrubber, sharing |
+| `.compact` | Minimal preview, auto-starts, good for thumbnails |
+
+### QLPreviewPanel (AppKit Floating Panel)
 
 ```swift
 final class PreviewController: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
@@ -805,6 +979,11 @@ final class DocumentFilePresenter: NSObject, NSFilePresenter {
 
 - [references/servicemanagement-launch-agents.md](references/servicemanagement-launch-agents.md) — Complete SMAppService patterns, LaunchAgent/LaunchDaemon plist format, migration from `SMLoginItemSetEnabled`
 - [references/pasteboard-spotlight.md](references/pasteboard-spotlight.md) — NSPasteboard patterns, custom UTType registration, Core Spotlight indexing, Quick Look integration
+- [Apple: SMAppService documentation](https://developer.apple.com/documentation/servicemanagement/smappservice)
+- [Apple: NSWorkspace documentation](https://developer.apple.com/documentation/appkit/nsworkspace)
+- [Apple: NSPasteboard documentation](https://developer.apple.com/documentation/appkit/nspasteboard)
+- [Apple: Core Spotlight semantic search (WWDC24)](https://developer.apple.com/videos/play/wwdc2024/10131/)
+- [Apple: QLPreviewView documentation](https://developer.apple.com/documentation/quicklookui/qlpreviewview)
 - SwiftUI state management: see `swiftui-patterns` skill
 - Keychain and credential storage: see `swift-security` skill
 - AppKit fundamentals: see `appkit-foundations` skill

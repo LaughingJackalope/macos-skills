@@ -1,8 +1,8 @@
 ---
 name: xcode-macos-toolchain
 description: "Build, archive, export, notarize, and unit test macOS apps with xcodebuild. Covers destination syntax for native macOS, Mac Catalyst, and universal binaries; archive/export workflows for Developer ID, Mac App Store, and development distribution; notarization with notarytool and stapling; macOS-specific build settings; and CI/CD pipeline patterns. Use when building macOS targets, configuring distribution pipelines, or debugging xcodebuild failures on macOS."
-sources: https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution, https://keith.github.io/xcode-man-pages/xcodebuild.1.html, https://github.com/rudrankriyam/app-store-connect-cli-skills/blob/main/skills/asc-notarization/SKILL.md, https://terminalmac.com/en/blog/articles/remote-mac-release-runbook-xcode-notary-ssh-m4-tmux/remote-mac-release-runbook-xcode-notary-ssh-m4-tmux.html
-researched: 2026-06-05
+sources: https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution, https://keith.github.io/xcode-man-pages/xcodebuild.1.html, https://github.com/rudrankriyam/app-store-connect-cli-skills/blob/main/skills/asc-notarization/SKILL.md, https://terminalmac.com/en/blog/articles/remote-mac-release-runbook-xcode-notary-ssh-m4-tmux/remote-mac-release-runbook-xcode-notary-ssh-m4-tmux.html, https://developer.apple.com/documentation/security/customizing-the-notarization-workflow, https://keith.github.io/xcode-man-pages/notarytool.1.html, https://developer.apple.com/library/archive/technotes/tn2339/_index.html
+researched: 2026-06-06
 platform: macOS 26+
 ---
 
@@ -64,6 +64,8 @@ xcodebuild -showdestinations -scheme MyApp
 ```
 
 This lists all valid destination specifiers for the scheme, including connected devices and simulators. Use this to discover the exact string for a specific Mac or configuration.
+
+**Disambiguating macOS vs. Mac Catalyst:** When both native macOS and Mac Catalyst destinations exist, `platform=macOS` alone may match the first one found (which could be Catalyst). To force native macOS, use `variant=macOS` (e.g., `generic/platform=macOS,variant=macOS`). To force Catalyst, use `variant=Mac Catalyst`. Note: `variant=macOS` may not yield a match in all Xcode versions — use `xcodebuild -showdestinations` to verify.
 
 ## Building
 
@@ -219,6 +221,8 @@ The plist keys differ by distribution method. Here are the three common cases:
 
 **Export failures:** If `-exportArchive` fails with a signing error, check that the archive was signed with a certificate matching the export method. Developer ID archives require a "Developer ID Application" certificate; Mac App Store archives require a "3rd Party Mac Developer Application" certificate. You cannot re-sign an archive — you must re-archive with the correct certificate.
 
+**PKG export for App Store Connect:** When exporting a PKG for App Store Connect upload, use `asc builds upload --pkg` with explicit `--version` and `--build-number` flags (these are not auto-extracted from PKGs as they are from IPAs).
+
 ## Notarization
 
 Notarization is Apple's automated malware scan. Required for Developer ID distribution on macOS 10.15+. A notarized app passes Gatekeeper without warning.
@@ -242,6 +246,17 @@ xcrun notarytool submit /tmp/MyApp.zip \
 ```bash
 ditto -c -k --keepParent /path/to/MyApp.app /tmp/MyApp.zip
 xcrun notarytool submit /tmp/MyApp.zip --apple-id ... --team-id --password ... --wait
+```
+
+**Notarization creates tickets** for the top-level file and any nested items (e.g., a disk image containing an installer and an app bundle). You cannot staple to a ZIP directly — staple each item inside the archive separately, then recreate the ZIP if needed.
+
+**Webhook notifications:** Use `--webhook <URL>` to receive a callback when notarization completes, instead of polling:
+
+```bash
+xcrun notarytool submit /tmp/MyApp.zip \
+  --keychain-profile "AC_PASSWORD" \
+  --wait \
+  --webhook "https://ci.example.com/notary-callback"
 ```
 
 ### Check Status (without --wait)
@@ -276,6 +291,21 @@ spctl --assess --type execute --verbose /path/to/MyApp.app
 ```bash
 xcrun stapler staple /path/to/MyApp.dmg
 ```
+
+**DMG notarization workflow (macOS 26+):**
+
+```bash
+# Sign the DMG itself
+codesign --force --timestamp --sign "Developer ID Application: ..." MyApp.dmg
+
+# Notarize the DMG directly (not the app inside it)
+xcrun notarytool submit MyApp.dmg --keychain-profile "AC_PASSWORD" --wait
+
+# Staple the DMG
+xcrun stapler staple MyApp.dmg
+```
+
+**macOS 26.2+ TCC caveat:** Avoid mounting DMGs at `/Volumes` in scripts due to TCC restrictions. Use `/private/tmp` for mounting in CI/release scripts.
 
 ### Keychain Profile (CI)
 
@@ -522,6 +552,10 @@ Then notarize and staple each variant separately.
 
 **Using `platform=macOS` in CI without a connected Mac.** `platform=macOS` targets the build host. In CI, this means the build machine must be a Mac. There is no macOS simulator — you cannot use `platform=macOS Simulator` like you can with iOS.
 
+**Notarizing a ZIP and then stapling the ZIP.** You cannot staple to a ZIP directly. Staple the `.app` or `.DMG` inside the archive, then recreate the ZIP if needed.
+
+**DMG mounting at `/Volumes` on macOS 26.2+.** TCI restrictions prevent mounting at `/Volumes` in scripts. Use `/private/tmp` for mounting in CI/release scripts.
+
 ## Review Checklist
 
 - [ ] `-destination` matches the target type (`platform=macOS` for native, `platform=macOS,variant=Mac Catalyst` for Catalyst)
@@ -535,9 +569,14 @@ Then notarize and staple each variant separately.
 - [ ] `xcrun stapler staple` runs only after `notarytool` reports `Accepted`
 - [ ] CI uses `--keychain-profile` instead of inline credentials for notarytool
 - [ ] `MACOSX_DEPLOYMENT_TARGET` is set explicitly (not relying on Xcode's default)
+- [ ] DMG notarized and stapled separately if distributing via disk image
+- [ ] `lipo -archs` confirms universal binary contains both `arm64` and `x86_64`
 
 ## References
 
 - [references/xcodebuild-macos.md](references/xcodebuild-macos.md) — Complete xcodebuild flag reference, export options plist templates, and CI/CD pipeline examples
 - [Apple: Notarizing macOS Software](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+- [Apple: Customizing the Notarization Workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
 - [Keith's xcodebuild man page](https://keith.github.io/xcode-man-pages/xcodebuild.1.html)
+- [Keith's notarytool man page](https://keith.github.io/xcode-man-pages/notarytool.1.html)
+- [Apple TN2339: Building from the Command Line with Xcode FAQ](https://developer.apple.com/library/archive/technotes/tn2339/_index.html)

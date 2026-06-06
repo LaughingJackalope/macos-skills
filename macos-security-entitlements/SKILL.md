@@ -1,8 +1,8 @@
 ---
 name: macos-security-entitlements
 description: "Configure macOS sandbox, hardened runtime, code signing, notarization, SMJobBless privileged helpers, SecureEnclave key storage, and LAContext biometric authentication. Use when enabling app capabilities, signing and notarizing a macOS app, setting up XPC helper tools for elevated operations, storing keys in the Secure Enclave, or integrating Touch ID / Apple Watch unlock."
-sources: https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution, https://help.apple.com/xcode/mac/current/en.lproj/devf87a2ac8f.html, https://developer.apple.com/documentation/bundleresources/entitlements, https://developer.apple.com/library/archive/technotes/tn2415/_index.html
-researched: 2026-06-05
+sources: https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution, https://help.apple.com/xcode/mac/current/en.lproj/devf87a2ac8f.html, https://developer.apple.com/documentation/bundleresources/entitlements, https://developer.apple.com/library/archive/technotes/tn2415/_index.html, https://developer.apple.com/documentation/security/hardened-runtime, https://developer.apple.com/documentation/security/customizing-the-notarization-workflow, https://developer.apple.com/documentation/servicemanagement/smjobbless(_:_:_:_:), https://developer.apple.com/documentation/xcode/configuring-the-macos-app-sandbox
+researched: 2026-06-05 (enhanced 2026-06-06)
 platform: macOS 26+
 ---
 
@@ -82,9 +82,12 @@ Both are independent — an app that only makes outbound requests needs only `cl
 |---|---|---|
 | `com.apple.security.device.camera` | `true` | Camera access |
 | `com.apple.security.device.microphone` | `true` | Microphone access |
+| `com.apple.security.device.audio-input` | `true` | Microphone input (alternate key, same as `.microphone`) |
 | `com.apple.security.device.usb` | `true` | USB device access |
+| `com.apple.security.device.bluetooth` | `true` | Bluetooth access |
+| `com.apple.security.device.serial` | `true` | Serial device access |
+| `com.apple.security.device.audio-video-bridging` | `true` | AV bridging for hardware capture |
 | `com.apple.security.print` | `true` | Printing |
-
 **Other common sandbox entitlements:**
 
 - `com.apple.security.automation.apple-events` — `true` to send Apple Events to other apps (requires `NSAppleEventsUsageDescription` in Info.plist)
@@ -106,8 +109,9 @@ Hardened Runtime is mandatory for notarization. It restricts your app to prevent
 | `com.apple.security.cs.allow-dyld-environment-variables` | `true` to allow `DYLD_*` environment variables (e.g., `DYLD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`). Only for development — never in notarized builds. |
 | `com.apple.security.automation.apple-events` | Send Apple Events to other apps. Requires the target app's bundle ID in the `NSAppleEventsUsageDescription` purpose string. |
 | `com.apple.security.cs.disable-executable-page-protection` | Disables W^X enforcement on executable pages. Extremely rare — only for specialized runtime compilers. Not accepted for notarization in most cases. |
-
 **Notarization impact:** The notary service checks for the `com.apple.security.get-task-allow` entitlement (set to `true` when debugging via Xcode). If present, notarization fails. Always remove it before submitting. Similarly, `allow-dyld-environment-variables` and `debugger` entitlements will cause rejection.
+
+**macOS 26 ARM64 JIT regression:** On macOS 26 (Tahoe) ARM64, JIT-enabled apps with both `allow-jit` entitlement and App Sandbox may crash when `mprotect` toggles pages between RW and RX (e.g., V8 background JIT thread). This does not occur on macOS 15.x or on Intel. If you encounter this, test without the sandbox first, and monitor Apple Developer Forums for updated guidance. Re-enabling library validation (`disable-library-validation` = false) is recommended unless you have a specific exception.
 
 **Minimal hardened runtime for a typical app:**
 
@@ -245,6 +249,27 @@ Common rejection reasons:
 - Unsigned nested binaries → sign all executables, dylibs, and frameworks
 - Hardened Runtime not enabled → add `--options runtime`
 - `altool` used instead of `notarytool` → switch to `notarytool` (required since Nov 2023)
+- Stapling directly to ZIP not supported → staple each item inside the archive, then recreate the ZIP
+
+**DMG distribution workflow:**
+
+```bash
+# 1. Sign the DMG itself
+codesign --force --timestamp --sign "Developer ID Application: Your Name (TEAM_ID)" MyApp.dmg
+
+# 2. Notarize the DMG (not the ZIP)
+xcrun notarytool submit MyApp.dmg --keychain-profile "AC_PASSWORD" --wait
+
+# 3. Staple the DMG
+xcrun stapler staple MyApp.dmg
+xcrun stapler validate MyApp.dmg
+
+# 4. Verify
+spctl --assess --type open --context context:primary-signature --verbose=4 MyApp.dmg
+```
+
+**macOS 26.2+ TCC /Volumes restriction:** On macOS 26.2+, avoid mounting DMGs at `/Volumes` in build scripts due to TCC restrictions. Use `/private/tmp` for intermediate mounting instead.
+
 
 ## SMJobBless / Privileged Helper Tools
 
@@ -256,22 +281,27 @@ SMJobBless is the supported mechanism for installing a privileged helper tool th
 MyApp.app/
   Contents/
     Library/
+      LaunchServices/            ← SMJobBless helper location (preferred)
+        com.example.MyHelper     ← Named by launchd label, not bundle name
       LoginItems/
-        MyHelper.app/          ← Helper bundle (app target, not a plain binary)
+        MyHelper.app/            ← Login item helper (runs in user context, GUI allowed)
         Contents/
-          Info.plist           ← SMAuthorizedClients array
+          Info.plist             ← SMAuthorizedClients array
           MacOS/
             MyHelper
     MacOS/
       MyApp
-    XPC Services/              ← (alternative location for XPC services)
 ```
+
+The helper executable must be placed at `Contents/Library/LaunchServices/` and named by its launchd label (e.g., `TEAMID.com.example.MyHelper`). The system sets `ProgramArguments` to a fixed, system-managed path upon installation — do not hardcode paths.
+
+The app's `Info.plist` must include `SMPrivilegedExecutables` specifying code-signing requirements for the helper. The helper's `Info.plist` must include `SMAuthorizedClients` with the app's bundle identifier. These two lists are the security contract — the system enforces that only an app in `SMAuthorizedClients` can bless a helper, and only a helper whose code signature matches `SMPrivilegedExecutables` is accepted.
 
 **Setup steps:**
 
-1. **Create a helper target** in Xcode (Cocoa App template, then strip the UI). The helper must be a proper `.app` bundle.
+1. **Create a helper target** in Xcode (Cocoa App template, then strip the UI). The helper must be a proper `.app` bundle. Place the built executable in `Contents/Library/LaunchServices/` and name it by its launchd label.
 
-2. **Configure the helper's Info.plist** with `SMAuthorizedClients` — an array of bundle identifiers allowed to connect:
+2. **Configure the helper's Info.plist** with `SMAuthorizedClients` — an array of bundle identifiers allowed to install it:
 
 ```xml
 <!-- Helper's Info.plist -->
@@ -281,14 +311,25 @@ MyApp.app/
 </array>
 ```
 
-3. **Configure the app's Info.plist** with `SMLoginItemEnabled` if using the LoginItems approach, or use `SMJobBless` directly.
+3. **Configure the app's Info.plist** with `SMPrivilegedExecutables` — an array of code-signing requirements the helper must satisfy:
 
-4. **Install the helper:**
+```xml
+<!-- App's Info.plist -->
+<key>SMPrivilegedExecutables</key>
+<array>
+    <dict>
+        <key>TEAMID.com.example.MyHelper</key>
+        <string>"TEAMID.com.example.MyHelper" anchor apple generic and identifier "TEAMID.com.example.MyHelper" and (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID)</string>
+    </dict>
+</array>
+```
+
+4. **Install the helper** (requires `kSMRightBlessPrivileges` authorization):
 
 ```swift
 import ServiceManagement
 
-func installHelper() -> Bool
+func installHelper() -> Bool {
     let helperBundleID = "TEAMID.com.example.MyHelper"
     var authRef: AuthorizationRef?
     let status = AuthorizationCreate(nil, nil, [.preAuthorize], &authRef)
@@ -303,6 +344,15 @@ func installHelper() -> Bool
         helperBundleID as CFString,
         auth,
         &error
+    )
+    if !success, let error = error?.takeRetainedValue() {
+        print("SMJobBless failed: \(error)")
+    }
+    return success
+}
+```
+
+5. **Communicate via XPC** using `NSXPCConnection`:
     )
     if !success, let error = error?.takeRetainedValue() {
         print("SMJobBless failed: \(error)")
@@ -331,10 +381,12 @@ helper?.performPrivilegedTask { result in
 **Critical rules:**
 - The helper and the app must be signed with the same team ID
 - The helper's `SMAuthorizedClients` must contain the app's bundle ID
+- The app's `SMPrivilegedExecutables` must contain code-signing requirements for the helper
 - The helper must be built as part of the same Xcode project (or at least signed with the same provisioning profile)
+- The helper executable must be placed in `Contents/Library/LaunchServices/` and named by its launchd label
 - Never use `AuthorizationExecuteWithPrivileges` — it's deprecated and not accepted for notarization
 - The helper tool itself must also be notarized as part of the app bundle
-
+- Use `kSMRightBlessPrivileges` authorization right when calling `SMJobBless`
 ## SecureEnclave on Apple Silicon
 
 The Secure Enclave is a hardware-isolated coprocessor on Apple Silicon Macs. Private keys generated inside it never leave the enclave — the CPU can only request signing/decryption operations.
@@ -531,19 +583,22 @@ csrutil status
 - [ ] Ticket stapled to distribution artifact
 - [ ] `spctl --assess` returns "accepted" with "Notarized Developer ID"
 - [ ] SMJobBless helper: `SMAuthorizedClients` matches app bundle ID
+- [ ] SMJobBless helper: `SMPrivilegedExecutables` configured in app's Info.plist
 - [ ] Secure Enclave keys use `.biometryCurrentSet` (not `.biometryAny`)
 - [ ] LAContext policy matches macOS capabilities (no Face ID assumptions)
 - [ ] No writes to SIP-protected paths
 - [ ] Entitlement files pass `plutil -lint`
-
+- [ ] DMG notarized and stapled separately if distributing via DMG
 ## References
 
 - [Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 - [Customizing the notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow)
 - [Resolving common notarization issues](https://developer.apple.com/documentation/security/resolving-common-notarization-issues)
 - [Enable hardened runtime](https://help.apple.com/xcode/mac/current/#/devf87a2ac8f)
+- [Hardened Runtime documentation](https://developer.apple.com/documentation/security/hardened-runtime)
+- [Configuring the macOS App Sandbox](https://developer.apple.com/documentation/xcode/configuring-the-macos-app-sandbox)
 - [Entitlements documentation](https://developer.apple.com/documentation/bundleresources/entitlements)
 - [Technical Note TN2415: Entitlements Troubleshooting](https://developer.apple.com/library/archive/technotes/tn2415/_index.html)
-- [SMJobBless reference](https://developer.apple.com/documentation/servicemanagement/smjobbless)
-- [SecKey Secure Enclave](https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/storing_keys_in_the_secure_enclave)
+- [SMJobBless reference](https://developer.apple.com/documentation/servicemanagement/smjobbless(_:_:_:_:))
+- [SecKey Secure Enclave](https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/storing_keys_in_secure_enclave)
 - [LAContext](https://developer.apple.com/documentation/localauthentication/lacontext)

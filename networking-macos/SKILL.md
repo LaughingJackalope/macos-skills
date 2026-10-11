@@ -49,7 +49,7 @@ for try await byte in asyncBytes {
     // process each UInt8
 }
 
-// Lines — line-delimited streaming (SSE, NDJSON)
+// Lines — line-delimited streaming (NDJSON). Not SSE: `.lines` drops empty lines (below)
 let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
 for try await line in asyncBytes.lines {
     // process each String
@@ -57,6 +57,8 @@ for try await line in asyncBytes.lines {
 ```
 
 **`bytes(for:)` with a custom trust delegate:** `bytes(for:)` and `bytes(from:)` send the server-trust challenge only to the task-level delegate method. A delegate that implements just the session-level one (the usual pinning snippet) works for `data(for:)` but fails the stream with -1202. See [TLS Pinning](#tls-pinning).
+
+**`.lines` drops empty lines, so don't frame SSE with it.** `AsyncLineSequence` (`bytes.lines`, `FileHandle.bytes.lines`, `URL.lines`) yields no empty lines at all, for `\n\n` and `\r\n\r\n` alike. A lone `\r` also ends a line. Measured 2026-10-11 (macOS 27.2): `"event: a\ndata: 1\n\nevent: b\ndata: 2\ndata: 3\n\n"` yields `["event: a", "data: 1", "event: b", "data: 2", "data: 3"]`. On a live SSE stream, 7 events (each ended by a blank line) yielded 21 lines, none of them empty. Server-Sent Events end each event with a blank line, and a multi-line event is several `data:` lines. A parser on `.lines` therefore can't see event boundaries: one that dispatches on the blank line never dispatches, and one that dispatches per `data:` line splits multi-line events. Per-`data:`-line dispatch is valid only when the server guarantees one `data:` line per event (OpenAI-style streams). Otherwise parse the bytes: see the SSE parser in [references/networking-patterns.md](references/networking-patterns.md#server-sent-events-sse-framing).
 
 **`data(for:)` vs `data(from:)`:** `data(for:)` takes a `URLRequest` (allows method, headers, body configuration); `data(from:)` takes a plain `URL` (GET only). The overload resolution can be ambiguous at call sites — be explicit:
 
@@ -785,6 +787,7 @@ macOS requires explicit permission to access the local network and multicast. Lo
 - **Forgetting `connection.start(queue: ...)`:** An NWConnection does nothing until started. This is the #1 reason connections appear to "hang."
 - **ATS exception without pinning:** Adding an ATS exception enables insecure connections without adding any compensating security. If you must use an exception, at minimum implement TLS pinning.
 - **Not handling `NWListener.Service.BrowseResults.changed`:** Service endpoints update (IP change, TXT record change). Ignoring `.changed` results in stale endpoint references.
+- **Framing SSE with `bytes.lines`:** `.lines` drops the blank lines that end SSE events, so event boundaries are lost. Parse the bytes (references → SSE framing), unless the server guarantees one `data:` line per event.
 - **Trust delegate with only the session-level challenge method:** `bytes(for:)` / `bytes(from:)` consult only `urlSession(_:task:didReceive:completionHandler:)`. With just the session-level method, `data(for:)` works but streaming (SSE, NDJSON) fails with -1202 whenever the stream opens its own connection. Conform to `URLSessionTaskDelegate` and implement both. Tests where the stream reuses a connection from an earlier request don't catch this.
 - **Pinning the leaf certificate (too tight):** If the server rotates certificates (Let's Encrypt every 90 days), leaf pinning breaks. Pin the intermediate CA or the public key SPKI hash instead.
 - **Using async/await with background URLSession:** Background sessions are delegate-only. The async convenience methods (`data(for:)`, `download(for:)`) do not work with background configurations.
@@ -803,6 +806,7 @@ macOS requires explicit permission to access the local network and multicast. Lo
 - [ ] `NWBrowser.stateUpdateHandler` handles `.failed` (including local network permission denied)
 - [ ] NWPathMonitor handler uses `path.status == .satisfied` and understands it's interface-level, not internet-level
 - [ ] TLS pinning checks certificate/public key before calling `.useCredential`
+- [ ] SSE streams are framed from bytes (blank line = end of event), not from `bytes.lines`
 - [ ] Custom trust delegates conform to `URLSessionTaskDelegate` and implement both challenge methods (required for `bytes(for:)` / `bytes(from:)`); a test makes the stream the first request on a fresh session
 - [ ] `com.apple.security.network.client` and `.server` entitlements are set
 - [ ] `com.apple.developer.networking.multicast` entitlement is set for Bonjour (NWBrowser/NWListener)

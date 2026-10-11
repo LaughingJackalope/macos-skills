@@ -190,6 +190,60 @@ for try await line in streamLines(from: url) {
 }
 ```
 
+`.lines` suits line-delimited formats such as NDJSON, where blank lines carry no meaning. It drops empty lines, so it can't frame Server-Sent Events. Use the parser below.
+
+### Server-Sent Events (SSE) framing
+
+An SSE event is a group of `field: value` lines ended by a **blank line**. A multi-line payload is several `data:` lines, joined with `\n`. `AsyncLineSequence` (`bytes.lines`) never yields the blank line, so feed the raw bytes to a parser instead:
+
+```swift
+/// SSE framing from raw bytes (`bytes.lines` drops the blank line that ends each event). Lines end with LF, CRLF or CR.
+struct SSEParser {
+    struct Event: Equatable { var id: String?; var event: String?; var data: String }
+
+    private var line: [UInt8] = []
+    private var afterCR = false
+    private var lastEventID: String?   // persists across events: send it as Last-Event-ID when reconnecting
+    private var event: String?
+    private var data: [String] = []
+
+    /// Feeds one byte; returns an event when a blank line completes one.
+    mutating func feed(_ byte: UInt8) -> Event? {
+        if afterCR {
+            afterCR = false
+            if byte == 0x0A { return nil }  // the LF of a CRLF: the CR already ended the line
+        }
+        guard byte == 0x0A || byte == 0x0D else { line.append(byte); return nil }
+        afterCR = byte == 0x0D
+        let text = String(decoding: line, as: UTF8.self)
+        line.removeAll(keepingCapacity: true)
+
+        if text.isEmpty {  // blank line: dispatch
+            defer { event = nil; data = [] }
+            return data.isEmpty ? nil : Event(id: lastEventID, event: event, data: data.joined(separator: "\n"))
+        }
+        if text.hasPrefix(":") { return nil }  // comment (keep-alive)
+        let parts = text.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        var value = parts.count > 1 ? String(parts[1]) : ""
+        if value.hasPrefix(" ") { value.removeFirst() }
+        switch parts[0] {
+        case "data": data.append(value)
+        case "event": event = value
+        case "id": lastEventID = value
+        default: break  // "retry" and unknown fields
+        }
+        return nil
+    }
+}
+
+// Usage
+let (bytes, response) = try await session.bytes(for: request)
+var parser = SSEParser()
+for try await byte in bytes {
+    if let event = parser.feed(byte) { handle(event) }
+}
+```
+
 ## NWConnection with TLS and State Management
 
 ### Full Connection Lifecycle

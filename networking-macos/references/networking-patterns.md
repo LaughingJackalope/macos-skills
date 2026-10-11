@@ -153,6 +153,8 @@ func fetchWithRetry<T: Decodable>(
 
 ### Streaming with `bytes(for:)`
 
+`URLSession.shared` uses system trust. On a session with a custom trust delegate (pinning, self-signed servers), `bytes(for:)` / `bytes(from:)` consult only the task-level challenge method. Implement both methods (SKILL.md → TLS Pinning) or the stream fails with -1202.
+
 ```swift
 func streamLines(from url: URL) -> AsyncThrowingStream<String, Error> {
     AsyncThrowingStream { continuation in

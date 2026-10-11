@@ -44,17 +44,21 @@ let (data, response) = try await URLSession.shared.upload(for: request, fromFile
 let (fileURL, response) = try await URLSession.shared.download(for: request)
 
 // Bytes — streaming response body
-let asyncBytes = try await URLSession.shared.bytes(for: request)
+let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
 for try await byte in asyncBytes {
     // process each UInt8
 }
 
-// Lines — line-delimited streaming (SSE, NDJSON)
-let asyncBytes = try await URLSession.shared.bytes(for: request)
+// Lines — line-delimited streaming (NDJSON). Not SSE: `.lines` drops empty lines (below)
+let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
 for try await line in asyncBytes.lines {
     // process each String
 }
 ```
+
+**`bytes(for:)` with a custom trust delegate:** `bytes(for:)` and `bytes(from:)` send the server-trust challenge only to the task-level delegate method. A delegate that implements just the session-level one (the usual pinning snippet) works for `data(for:)` but fails the stream with -1202. See [TLS Pinning](#tls-pinning).
+
+**`.lines` drops empty lines, so don't frame SSE with it.** `AsyncLineSequence` (`bytes.lines`, `FileHandle.bytes.lines`, `URL.lines`) yields no empty lines at all, for `\n\n` and `\r\n\r\n` alike. A lone `\r` also ends a line. Measured 2026-10-11 (macOS 27.2): `"event: a\ndata: 1\n\nevent: b\ndata: 2\ndata: 3\n\n"` yields `["event: a", "data: 1", "event: b", "data: 2", "data: 3"]`. On a live SSE stream, 7 events (each ended by a blank line) yielded 21 lines, none of them empty. Server-Sent Events end each event with a blank line, and a multi-line event is several `data:` lines. A parser on `.lines` therefore can't see event boundaries: one that dispatches on the blank line never dispatches, and one that dispatches per `data:` line splits multi-line events. Per-`data:`-line dispatch is valid only when the server guarantees one `data:` line per event (OpenAI-style streams). Otherwise parse the bytes: see the SSE parser in [references/networking-patterns.md](references/networking-patterns.md#server-sent-events-sse-framing).
 
 **`data(for:)` vs `data(from:)`:** `data(for:)` takes a `URLRequest` (allows method, headers, body configuration); `data(from:)` takes a plain `URL` (GET only). The overload resolution can be ambiguous at call sites — be explicit:
 
@@ -646,58 +650,78 @@ URLSession falls back to H2 or H/1.1 if HTTP/3 is not available.
 
 ## TLS Pinning
 
-Implement TLS (certificate or public key) pinning via `URLSessionDelegate`:
+Implement TLS (certificate or public key) pinning in a delegate that conforms to `URLSessionTaskDelegate` and implements **both** challenge methods, each forwarding to one evaluation. The session-level method alone is not enough: async `bytes(for:)` / `bytes(from:)` never call it (table below).
 
 ```swift
-final class PinningURLSessionDelegate: NSObject, URLSessionDelegate {
-    // Store the SPKI hash (SHA-256 of the public key info, base64)
-    let pinnedSPKIHashes: Set<String>>
+import Security
 
+final class PinningURLSessionDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    let pinnedCertData: Data  // DER of the pinned certificate, e.g. loaded from the bundle
+
+    init(pinnedCertData: Data) { self.pinnedCertData = pinnedCertData }
+
+    // Session-level: data, upload, download and WebSocket tasks consult this one.
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.authenticationMethod ==
-                NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust else {
+        evaluate(challenge, completionHandler)
+    }
+
+    // Task-level: the only one async `bytes(for:)` / `bytes(from:)` consult.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        evaluate(challenge, completionHandler)
+    }
+
+    private func evaluate(
+        _ challenge: URLAuthenticationChallenge,
+        _ completionHandler: (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        // The task-level method also receives HTTP auth challenges (Basic, Digest, …): leave those to the system.
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        guard let serverTrust = challenge.protectionSpace.serverTrust,
+              SecTrustEvaluateWithError(serverTrust, nil),  // omit for a self-signed server (see below)
+              let serverCert = (SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate])?.first else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
 
-        var error: CFError?
-        guard SecTrustEvaluateWithError(serverTrust, &error) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-
-        // Certificate pinning: pin a specific certificate
-        guard let serverCert = SecTrustGetCertificateAtIndex(serverTrust, 0) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-
-        let serverCertData = SecCertificateCopyData(serverCert) as Data
-        let pinnedCertData = loadPinnedCertificateData()  // Load from bundle
-
-        if serverCertData == pinnedCertData {
+        // Certificate pinning: the leaf must be the pinned certificate.
+        // Alternative: pin the public key instead (survives re-issuing a certificate for the same key pair) by
+        // comparing a hash of SecCertificateCopyKey(serverCert)'s external representation. Call completionHandler
+        // exactly once, whichever check you use.
+        if SecCertificateCopyData(serverCert) as Data == pinnedCertData {
             completionHandler(.useCredential, URLCredential(trust: serverTrust))
         } else {
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
-
-        // Alternative: pin public key (survives certificate rotation within same keypair)
-        // if let serverKey = SecCertificateCopyKey(serverCert),
-        //    let serverKeyData = SecKeyCopyExternalRepresentation(serverKey, nil) {
-        //     let hash = SHA256.hash(data: serverKeyData as Data)
-        //     if pinnedSPKIHashes.contains(Data(hash).base64EncodedString()) {
-        //         completionHandler(.useCredential, URLCredential(trust: serverTrust))
-        //         return
-        //     }
-        // }
     }
 }
 ```
+
+**Which calls consult which method.** Measured 2026-10-11 (macOS 27.2, Swift 6.4) against a self-signed HTTPS server. Each call was the first request on a fresh `.ephemeral` session whose delegate implemented only the session-level method:
+
+| Call | Session-level challenge method consulted? |
+|---|---|
+| `data(for:)`, `upload(for:from:)`, `download(for:)`, `webSocketTask(with:)` | Yes |
+| `bytes(for:)`, `bytes(from:)` | **No.** The handler is never called and the request fails with `NSURLErrorServerCertificateUntrusted` (-1202, "The certificate for this server is invalid") |
+
+With both methods implemented, all six succeed. This contradicts the documented routing, which treats server trust as a session-level challenge, so implement both instead of relying on the docs.
+
+**Connection reuse hides the bug.** A stream that reuses a connection an earlier `data(for:)` already opened gets no challenge. So code that calls another endpoint first works, and the stream fails only when it opens its own connection: as the first request on a session, as a second concurrent connection, or after the server closed the idle one. In tests, make the stream the **first request on a fresh session**, and check that a wrong pin still refuses it.
+
+**Per-task delegates.** `bytes(for:delegate:)` accepts a task-specific delegate, which isn't needed once the session delegate implements the task-level method. If you pass one anyway, pass the same trust object, so one pin check decides.
+
+**Self-signed servers (LAN devices, paired appliances):** system evaluation always rejects a self-signed certificate (default handling is what produces -1202). Drop the `SecTrustEvaluateWithError` check and let the pin be the whole trust decision. Typically that's the SHA-256 of the certificate's DER, recorded at pairing (trust on first use) and required on every later connection.
 
 **Pitfalls with pinning + ATS:** If you pin a certificate but the certificate meets ATS requirements, everything works. If the certificate does NOT meet ATS requirements (e.g., SHA-1 signature), you need BOTH an ATS exception AND pinning — the ATS exception disables system trust validation, and pinning replaces it with your own. This is intentionally difficult as Apple discourages connecting to insecure servers.
 
@@ -763,6 +787,8 @@ macOS requires explicit permission to access the local network and multicast. Lo
 - **Forgetting `connection.start(queue: ...)`:** An NWConnection does nothing until started. This is the #1 reason connections appear to "hang."
 - **ATS exception without pinning:** Adding an ATS exception enables insecure connections without adding any compensating security. If you must use an exception, at minimum implement TLS pinning.
 - **Not handling `NWListener.Service.BrowseResults.changed`:** Service endpoints update (IP change, TXT record change). Ignoring `.changed` results in stale endpoint references.
+- **Framing SSE with `bytes.lines`:** `.lines` drops the blank lines that end SSE events, so event boundaries are lost. Parse the bytes (references → SSE framing), unless the server guarantees one `data:` line per event.
+- **Trust delegate with only the session-level challenge method:** `bytes(for:)` / `bytes(from:)` consult only `urlSession(_:task:didReceive:completionHandler:)`. With just the session-level method, `data(for:)` works but streaming (SSE, NDJSON) fails with -1202 whenever the stream opens its own connection. Conform to `URLSessionTaskDelegate` and implement both. Tests where the stream reuses a connection from an earlier request don't catch this.
 - **Pinning the leaf certificate (too tight):** If the server rotates certificates (Let's Encrypt every 90 days), leaf pinning breaks. Pin the intermediate CA or the public key SPKI hash instead.
 - **Using async/await with background URLSession:** Background sessions are delegate-only. The async convenience methods (`data(for:)`, `download(for:)`) do not work with background configurations.
 - **Missing `NSBonjourServices` in Info.plist:** Without declaring your Bonjour service types, NWBrowser may fail silently on macOS 14+.
@@ -780,6 +806,8 @@ macOS requires explicit permission to access the local network and multicast. Lo
 - [ ] `NWBrowser.stateUpdateHandler` handles `.failed` (including local network permission denied)
 - [ ] NWPathMonitor handler uses `path.status == .satisfied` and understands it's interface-level, not internet-level
 - [ ] TLS pinning checks certificate/public key before calling `.useCredential`
+- [ ] SSE streams are framed from bytes (blank line = end of event), not from `bytes.lines`
+- [ ] Custom trust delegates conform to `URLSessionTaskDelegate` and implement both challenge methods (required for `bytes(for:)` / `bytes(from:)`); a test makes the stream the first request on a fresh session
 - [ ] `com.apple.security.network.client` and `.server` entitlements are set
 - [ ] `com.apple.developer.networking.multicast` entitlement is set for Bonjour (NWBrowser/NWListener)
 - [ ] `NSBonjourServices` declared in Info.plist for Bonjour service types
